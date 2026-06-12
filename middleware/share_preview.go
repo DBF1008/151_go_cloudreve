@@ -88,13 +88,13 @@ func SharePreview(dep dependency.Dep) gin.HandlerFunc {
 			return
 		}
 
-		id, password := extractShareParams(c)
+		id, password, subPath := extractShareParams(c)
 		if id == "" {
 			c.Next()
 			return
 		}
 
-		html := renderShareOGPage(c, dep, id, password)
+		html := renderShareOGPage(c, dep, id, password, subPath)
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.Header("Cache-Control", "public, no-cache")
 		c.String(200, html)
@@ -102,7 +102,14 @@ func SharePreview(dep dependency.Dep) gin.HandlerFunc {
 	}
 }
 
-func extractShareParams(c *gin.Context) (id, password string) {
+// extractShareParams resolves the share id, password and the (optional) sub-path
+// inside the shared directory from the request. Two link shapes are supported:
+//
+//   - Short link:  /s/<id>/<password>?path=/sub/target  (sub-path in the query)
+//   - Long link:   /home?path=cloudreve://<id>:<pw>@share/sub/target
+//
+// subPath is empty when the request targets the share root.
+func extractShareParams(c *gin.Context) (id, password, subPath string) {
 	urlPath := c.Request.URL.Path
 
 	if strings.HasPrefix(urlPath, "/s/") {
@@ -112,21 +119,22 @@ func extractShareParams(c *gin.Context) (id, password string) {
 			if len(parts) >= 2 {
 				password = parts[1]
 			}
+			subPath = c.Query("path")
 		}
 	} else if urlPath == "/home" || urlPath == "/home/" {
 		rawPath := c.Query("path")
 		uri, err := fs.NewUriFromString(rawPath)
 		if err != nil || uri.FileSystem() != constants.FileSystemShare {
-			return "", ""
+			return "", "", ""
 		}
 
-		return uri.ID(""), uri.Password()
+		return uri.ID(""), uri.Password(), uri.PathTrimmed()
 	}
 
-	return id, password
+	return id, password, subPath
 }
 
-func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password string) string {
+func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password, subPath string) string {
 	settings := dep.SettingProvider()
 	siteBasic := settings.SiteBasic(c)
 	pwa := settings.PWA(c)
@@ -163,14 +171,47 @@ func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password string) 
 		return renderOGHTML(data)
 	}
 
-	data.Title = shareInfo.Name
-	if shareInfo.SourceType != nil && *shareInfo.SourceType == types.FileTypeFolder {
+	// Default to the root share preview. These values also serve as the safe
+	// fallback whenever a requested sub-path turns out to be illegal.
+	name := shareInfo.Name
+	isFolder := shareInfo.SourceType != nil && *shareInfo.SourceType == types.FileTypeFolder
+	size := shareInfo.Size
+	unlocked := shareInfo.Unlocked
+
+	var thumbURI string
+	if shareURI, uriErr := fs.NewUriFromString(fs.NewShareUri(id, password)); uriErr == nil {
+		// Root thumbnail lives at <shareRoot>/<name> so single-file shares resolve.
+		thumbURI = shareURI.Join(name).String()
+
+		// When a sub-path is requested, describe the deep target instead. The
+		// share navigator confines resolution to the share root and enforces the
+		// password, so any illegal sub-path simply fails and degrades to root.
+		if subPath != "" {
+			targetURI := shareURI.JoinRaw(subPath)
+			if cleanSub := targetURI.PathTrimmed(); cleanSub != "" {
+				if target, ok := loadShareTargetInfo(c, targetURI.String()); ok {
+					name = target.Name
+					isFolder = target.Type == int(types.FileTypeFolder)
+					size = target.Size
+					unlocked = true
+					thumbURI = targetURI.String()
+
+					data.ShareURL = buildShareDeepShortURL(base, id, password, cleanSub)
+					data.RedirectURL = buildShareDeepRedirectURL(targetURI)
+				}
+			}
+		}
+	}
+
+	data.Title = name
+	if isFolder {
 		data.Description = "Folder"
-	} else if shareInfo.Unlocked {
-		data.Description = formatFileSize(shareInfo.Size)
-		thumbnail, err := loadShareThumbnail(c, id, password, shareInfo)
-		if err == nil {
-			data.ImageURL = thumbnail
+	} else if unlocked {
+		data.Description = formatFileSize(size)
+		if thumbURI != "" {
+			if thumbnail, err := loadShareThumbnail(c, thumbURI); err == nil {
+				data.ImageURL = thumbnail
+			}
 		}
 	}
 
@@ -178,15 +219,8 @@ func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password string) 
 	return renderOGHTML(data)
 }
 
-func loadShareThumbnail(c *gin.Context, shareID, password string, shareInfo *explorer.Share) (string, error) {
-	shareUri, err := fs.NewUriFromString(fs.NewShareUri(shareID, password))
-	if err != nil {
-		return "", fmt.Errorf("failed to construct share uri: %w", err)
-	}
-
-	subService := &explorer.FileThumbService{
-		Uri: shareUri.Join(shareInfo.Name).String(),
-	}
+func loadShareThumbnail(c *gin.Context, thumbURI string) (string, error) {
+	subService := &explorer.FileThumbService{Uri: thumbURI}
 
 	if err := SetUserCtx(c, 0); err != nil {
 		return "", err
@@ -198,6 +232,44 @@ func loadShareThumbnail(c *gin.Context, shareID, password string, shareInfo *exp
 	}
 
 	return res.Url, nil
+}
+
+// loadShareTargetInfo resolves the file/folder addressed by a full share URI
+// (including any sub-path). It returns ok=false for any inaccessible target —
+// non-existent path, wrong/missing password, or insufficient permission — so the
+// caller can safely fall back to the share root preview.
+func loadShareTargetInfo(c *gin.Context, targetURI string) (*explorer.FileResponse, bool) {
+	if err := SetUserCtx(c, 0); err != nil {
+		return nil, false
+	}
+
+	subService := &explorer.GetFileInfoService{Uri: targetURI}
+	res, err := subService.Get(c)
+	if err != nil || res == nil {
+		return nil, false
+	}
+
+	return res, true
+}
+
+// buildShareDeepShortURL builds the canonical short share URL pointing at a deep
+// target, e.g. /s/<id>/<password>?path=/sub/target.
+func buildShareDeepShortURL(base *url.URL, id, password, subPath string) string {
+	u := routes.MasterShareUrl(base, id, password)
+	q := u.Query()
+	q.Set("path", fs.Separator+subPath)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// buildShareDeepRedirectURL builds the SPA redirect URL that opens the deep
+// target directly (/home?path=cloudreve://<id>:<pw>@share/sub/target).
+func buildShareDeepRedirectURL(target *fs.URI) string {
+	route, _ := url.Parse("/home")
+	q := route.Query()
+	q.Set("path", target.String())
+	route.RawQuery = q.Encode()
+	return route.String()
 }
 
 func loadShareForOG(c *gin.Context, shareID int, password string) (*explorer.Share, error) {
