@@ -1308,6 +1308,12 @@ func initMasterRouter(dep dependency.Dep) *gin.Engine {
 						middleware.HashID(hashid.DavAccountID),
 						controllers.DeleteDAVAccounts,
 					)
+					// Rotate WebDAV account password
+					dav.POST(":id/password",
+						middleware.RequiredScopes(types.ScopeDavAccountWrite),
+						middleware.HashID(hashid.DavAccountID),
+						controllers.RotateDAVAccountPassword,
+					)
 				}
 				//// 获取账号信息
 				//devices.GET("dav", controllers.GetWebDAVAccounts)

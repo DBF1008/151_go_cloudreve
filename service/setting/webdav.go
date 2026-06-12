@@ -202,3 +202,27 @@ func DeleteDavAccount(c *gin.Context) error {
 
 	return nil
 }
+
+// RotateDavAccountPassword generates and persists a new random password for an
+// existing WebDAV account, leaving its URI, name and options untouched. Only the
+// owner of the account may rotate its password; ownership and hashid handling
+// mirror the other per-account device endpoints (update/delete).
+func RotateDavAccountPassword(c *gin.Context) (*DavAccount, error) {
+	dep := dependency.FromContext(c)
+	user := inventory.UserFromContext(c)
+	accountId := hashid.FromContext(c)
+
+	// Find existing account, scoped to the requesting user.
+	davAccountClient := dep.DavAccountClient()
+	if _, err := davAccountClient.GetByIDAndUserID(c, accountId, user.ID); err != nil {
+		return nil, serializer.NewError(serializer.CodeNotFound, "Account not exist", err)
+	}
+
+	account, err := davAccountClient.UpdatePassword(c, accountId, util.RandString(32, util.RandomLowerCases))
+	if err != nil {
+		return nil, serializer.NewError(serializer.CodeDBError, "Failed to rotate dav account password", err)
+	}
+
+	accountRes := BuildDavAccount(account, dep.HashIDEncoder())
+	return &accountRes, nil
+}

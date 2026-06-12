@@ -65,6 +65,21 @@ func DeleteDAVAccounts(c *gin.Context) {
 	c.JSON(200, serializer.Response{})
 }
 
+// RotateDAVAccountPassword regenerates the password of a WebDAV account, keeping
+// its URI, name and options intact.
+func RotateDAVAccountPassword(c *gin.Context) {
+	resp, err := setting.RotateDavAccountPassword(c)
+	if err != nil {
+		c.JSON(200, serializer.Err(c, err))
+		c.Abort()
+		return
+	}
+
+	c.JSON(200, serializer.Response{
+		Data: resp,
+	})
+}
+
 //
 //// DeleteWebDAVAccounts 删除WebDAV账户
 //func DeleteWebDAVAccounts(c *gin.Context) {
