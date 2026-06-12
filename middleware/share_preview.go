@@ -10,9 +10,11 @@ import (
 
 	"github.com/cloudreve/Cloudreve/v4/application/constants"
 	"github.com/cloudreve/Cloudreve/v4/application/dependency"
+	"github.com/cloudreve/Cloudreve/v4/inventory"
 	"github.com/cloudreve/Cloudreve/v4/inventory/types"
 	"github.com/cloudreve/Cloudreve/v4/pkg/cluster/routes"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/fs"
+	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/manager"
 	"github.com/cloudreve/Cloudreve/v4/pkg/hashid"
 	"github.com/cloudreve/Cloudreve/v4/pkg/serializer"
 	"github.com/cloudreve/Cloudreve/v4/pkg/util"
@@ -88,13 +90,13 @@ func SharePreview(dep dependency.Dep) gin.HandlerFunc {
 			return
 		}
 
-		id, password := extractShareParams(c)
+		id, password, subPath := extractShareParams(c)
 		if id == "" {
 			c.Next()
 			return
 		}
 
-		html := renderShareOGPage(c, dep, id, password)
+		html := renderShareOGPage(c, dep, id, password, subPath)
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.Header("Cache-Control", "public, no-cache")
 		c.String(200, html)
@@ -102,7 +104,7 @@ func SharePreview(dep dependency.Dep) gin.HandlerFunc {
 	}
 }
 
-func extractShareParams(c *gin.Context) (id, password string) {
+func extractShareParams(c *gin.Context) (id, password, subPath string) {
 	urlPath := c.Request.URL.Path
 
 	if strings.HasPrefix(urlPath, "/s/") {
@@ -113,31 +115,65 @@ func extractShareParams(c *gin.Context) (id, password string) {
 				password = parts[1]
 			}
 		}
+		// Short links carry sub-path in the ?path= query parameter
+		subPath = sanitizeSubPath(c.Query("path"))
 	} else if urlPath == "/home" || urlPath == "/home/" {
 		rawPath := c.Query("path")
 		uri, err := fs.NewUriFromString(rawPath)
 		if err != nil || uri.FileSystem() != constants.FileSystemShare {
-			return "", ""
+			return "", "", ""
 		}
 
-		return uri.ID(""), uri.Password()
+		return uri.ID(""), uri.Password(), sanitizeSubPath(uri.PathTrimmed())
 	}
 
-	return id, password
+	return id, password, subPath
 }
 
-func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password string) string {
+// sanitizeSubPath cleans a user-supplied sub-path for safe use in share URI construction.
+// It strips path traversal attempts (..), empty segments, and leading/trailing slashes.
+// Returns empty string if the path contains unsafe components.
+func sanitizeSubPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+
+	// Reject raw ".." components before cleaning to prevent path traversal.
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return ""
+		}
+	}
+
+	cleaned := strings.TrimPrefix(p, "/")
+	cleaned = strings.TrimSuffix(cleaned, "/")
+	if cleaned == "" || cleaned == "." {
+		return ""
+	}
+
+	return cleaned
+}
+
+func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password, subPath string) string {
 	settings := dep.SettingProvider()
 	siteBasic := settings.SiteBasic(c)
 	pwa := settings.PWA(c)
 	base := settings.SiteURL(c)
 
+	// Build default share URL and redirect URL (root share, no sub-path).
+	shareURL := routes.MasterShareUrl(base, id, password).String()
+	redirectURL := routes.MasterShareLongUrl(id, password).String()
+	if subPath != "" {
+		redirectURL = buildSubPathRedirectURL(id, password, subPath)
+	}
+
 	data := &ogData{
 		SiteName:    siteBasic.Name,
 		Title:       siteBasic.Name,
 		Description: siteBasic.Description,
-		ShareURL:    routes.MasterShareUrl(base, id, password).String(),
-		RedirectURL: routes.MasterShareLongUrl(id, password).String(),
+		ShareURL:    shareURL,
+		RedirectURL: redirectURL,
 	}
 
 	if pwa.LargeIcon != "" {
@@ -146,13 +182,13 @@ func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password string) 
 		data.ImageURL = resolveURL(base, pwa.MediumIcon)
 	}
 
-	shareID, err := dep.HashIDEncoder().Decode(id, hashid.ShareID)
+	shareIDInt, err := dep.HashIDEncoder().Decode(id, hashid.ShareID)
 	if err != nil {
 		data.Description = ogStatusInvalidLink
 		return renderOGHTML(data)
 	}
 
-	shareInfo, err := loadShareForOG(c, shareID, password)
+	shareInfo, err := loadShareForOG(c, shareIDInt, password)
 	if err != nil {
 		var appErr serializer.AppError
 		if errors.As(err, &appErr) {
@@ -163,29 +199,120 @@ func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password string) 
 		return renderOGHTML(data)
 	}
 
+	// Start with root share metadata.
 	data.Title = shareInfo.Name
-	if shareInfo.SourceType != nil && *shareInfo.SourceType == types.FileTypeFolder {
+	targetName := shareInfo.Name
+	targetSize := shareInfo.Size
+	var targetType *types.FileType
+	if shareInfo.SourceType != nil {
+		t := *shareInfo.SourceType
+		targetType = &t
+	}
+
+	// If the share is unlocked and a valid sub-path is provided, resolve it to
+	// produce OGP metadata that reflects the actual target file or folder.
+	// On any failure (invalid path, permission denied, etc.) we silently fall
+	// back to the root share metadata — this is the "safe degradation" path.
+	if shareInfo.Unlocked && subPath != "" {
+		if file, resolveErr := resolveSubPath(c, dep, id, password, subPath); resolveErr == nil && file != nil {
+			targetName = file.DisplayName()
+			t := file.Type()
+			targetType = &t
+			targetSize = file.Size()
+
+			// Override share URL to point at the resolved sub-path target.
+			subURL := routes.MasterShareUrl(base, id, password)
+			q := subURL.Query()
+			q.Set("path", subPath)
+			subURL.RawQuery = q.Encode()
+			data.ShareURL = subURL.String()
+		}
+		// If resolveErr != nil we keep root share metadata — safe degradation.
+	}
+
+	// Populate description and thumbnail based on resolved target type.
+	if targetType != nil && *targetType == types.FileTypeFolder {
 		data.Description = "Folder"
 	} else if shareInfo.Unlocked {
-		data.Description = formatFileSize(shareInfo.Size)
-		thumbnail, err := loadShareThumbnail(c, id, password, shareInfo)
-		if err == nil {
-			data.ImageURL = thumbnail
+		data.Description = formatFileSize(targetSize)
+		if targetType != nil && *targetType == types.FileTypeFile {
+			thumbURI := buildShareThumbUri(id, password, subPath, targetName)
+			if thumbURL, err := loadShareThumbnail(c, thumbURI); err == nil {
+				data.ImageURL = thumbURL
+			}
 		}
 	}
 
+	data.Title = targetName
 	data.Description += " · " + shareInfo.Owner.Nickname
 	return renderOGHTML(data)
 }
 
-func loadShareThumbnail(c *gin.Context, shareID, password string, shareInfo *explorer.Share) (string, error) {
+// resolveSubPath resolves a sub-path within a share to the target file or folder.
+// Returns nil, nil if the path is empty. Returns nil, error on any resolution failure.
+func resolveSubPath(c *gin.Context, dep dependency.Dep, shareID, password, subPath string) (fs.File, error) {
+	if subPath == "" {
+		return nil, nil
+	}
+
 	shareUri, err := fs.NewUriFromString(fs.NewShareUri(shareID, password))
 	if err != nil {
-		return "", fmt.Errorf("failed to construct share uri: %w", err)
+		return nil, fmt.Errorf("failed to construct share uri: %w", err)
+	}
+	targetUri := shareUri.JoinRaw(subPath)
+
+	if err := SetUserCtx(c, 0); err != nil {
+		return nil, err
+	}
+
+	u := inventory.UserFromContext(c)
+	m := manager.NewFileManager(dep, u)
+	defer m.Recycle()
+
+	file, err := m.Get(c, targetUri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve sub-path: %w", err)
+	}
+
+	return file, nil
+}
+
+// buildSubPathRedirectURL constructs the long redirect URL that includes a sub-path.
+func buildSubPathRedirectURL(id, password, subPath string) string {
+	base, _ := url.Parse("/home")
+	q := base.Query()
+	shareUri, err := fs.NewUriFromString(fs.NewShareUri(id, password))
+	if err != nil {
+		return routes.MasterShareLongUrl(id, password).String()
+	}
+	q.Set("path", shareUri.JoinRaw(subPath).String())
+	base.RawQuery = q.Encode()
+	return base.String()
+}
+
+// buildShareThumbUri constructs the full share URI used for thumbnail loading.
+// If subPath is non-empty the URI targets the sub-path file; otherwise it targets
+// the root share file identified by fileName.
+func buildShareThumbUri(shareID, password, subPath, fileName string) string {
+	shareUri, _ := fs.NewUriFromString(fs.NewShareUri(shareID, password))
+	if shareUri == nil {
+		return ""
+	}
+	if subPath != "" {
+		return shareUri.JoinRaw(subPath).String()
+	}
+	return shareUri.Join(fileName).String()
+}
+
+// loadShareThumbnail loads the thumbnail URL for the file identified by the given
+// share URI. The URI should already point to the target file (root or sub-path).
+func loadShareThumbnail(c *gin.Context, shareUriStr string) (string, error) {
+	if shareUriStr == "" {
+		return "", fmt.Errorf("empty share uri")
 	}
 
 	subService := &explorer.FileThumbService{
-		Uri: shareUri.Join(shareInfo.Name).String(),
+		Uri: shareUriStr,
 	}
 
 	if err := SetUserCtx(c, 0); err != nil {
