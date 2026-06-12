@@ -16,12 +16,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v4/inventory/types"
 	"github.com/cloudreve/Cloudreve/v4/pkg/cluster/routes"
 	"github.com/cloudreve/Cloudreve/v4/pkg/credmanager"
-	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/cos"
-	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/ks3"
-	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/obs"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/onedrive"
-	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/oss"
-	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/driver/s3"
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/manager"
 	"github.com/cloudreve/Cloudreve/v4/pkg/logging"
 	"github.com/cloudreve/Cloudreve/v4/pkg/util"
@@ -327,67 +322,10 @@ type (
 func (service *CreateStoragePolicyCorsService) Create(c *gin.Context) error {
 	dep := dependency.FromContext(c)
 
-	switch service.Policy.Type {
-	case types.PolicyTypeOss:
-		handler, err := oss.New(c, service.Policy, dep.SettingProvider(), dep.ConfigProvider(), dep.Logger(), dep.MimeDetector(c))
-		if err != nil {
-			return serializer.NewError(serializer.CodeDBError, "Failed to create oss driver", err)
-		}
-		if err := handler.CORS(); err != nil {
-			return serializer.NewError(serializer.CodeInternalSetting, "Failed to create cors: "+err.Error(), err)
-		}
+	m := manager.NewFileManager(dep, inventory.UserFromContext(c))
+	defer m.Recycle()
 
-		return nil
-
-	case types.PolicyTypeCos:
-		handler, err := cos.New(c, service.Policy, dep.SettingProvider(), dep.ConfigProvider(), dep.Logger(), dep.MimeDetector(c))
-		if err != nil {
-			return serializer.NewError(serializer.CodeDBError, "Failed to create cos driver", err)
-		}
-
-		if err := handler.CORS(); err != nil {
-			return serializer.NewError(serializer.CodeInternalSetting, "Failed to create cors: "+err.Error(), err)
-		}
-
-		return nil
-
-	case types.PolicyTypeS3:
-		handler, err := s3.New(c, service.Policy, dep.SettingProvider(), dep.ConfigProvider(), dep.Logger(), dep.MimeDetector(c))
-		if err != nil {
-			return serializer.NewError(serializer.CodeDBError, "Failed to create s3 driver", err)
-		}
-
-		if err := handler.CORS(); err != nil {
-			return serializer.NewError(serializer.CodeInternalSetting, "Failed to create cors: "+err.Error(), err)
-		}
-
-		return nil
-
-	case types.PolicyTypeKs3:
-		handler, err := ks3.New(c, service.Policy, dep.SettingProvider(), dep.ConfigProvider(), dep.Logger(), dep.MimeDetector(c))
-		if err != nil {
-			return serializer.NewError(serializer.CodeDBError, "Failed to create ks3 driver", err)
-		}
-
-		if err := handler.CORS(); err != nil {
-			return serializer.NewError(serializer.CodeInternalSetting, "Failed to create cors: "+err.Error(), err)
-		}
-
-		return nil
-	case types.PolicyTypeObs:
-		handler, err := obs.New(c, service.Policy, dep.SettingProvider(), dep.ConfigProvider(), dep.Logger(), dep.MimeDetector(c))
-		if err != nil {
-			return serializer.NewError(serializer.CodeDBError, "Failed to create obs driver", err)
-		}
-
-		if err := handler.CORS(); err != nil {
-			return serializer.NewError(serializer.CodeInternalSetting, "Failed to create cors: "+err.Error(), err)
-		}
-
-		return nil
-	default:
-		return serializer.NewError(serializer.CodeParamErr, "Unsupported policy type", nil)
-	}
+	return m.EnableCORS(c, service.Policy)
 }
 
 type (

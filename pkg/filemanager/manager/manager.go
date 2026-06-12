@@ -77,6 +77,9 @@ type (
 		CastStoragePolicyOnSlave(ctx context.Context, policy *ent.StoragePolicy) *ent.StoragePolicy
 		// GetStorageDriver gets storage driver for given policy
 		GetStorageDriver(ctx context.Context, policy *ent.StoragePolicy) (driver.Handler, error)
+		// EnableCORS provisions CORS rules on the storage backend of the given policy.
+		// Only policy types whose driver supports CORS are accepted.
+		EnableCORS(ctx context.Context, policy *ent.StoragePolicy) error
 		// PatchView patches the view setting of a file
 		PatchView(ctx context.Context, uri *fs.URI, view *types.ExplorerView) error
 	}

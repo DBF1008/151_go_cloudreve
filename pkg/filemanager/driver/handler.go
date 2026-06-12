@@ -86,6 +86,14 @@ type (
 		MediaMeta(ctx context.Context, path, ext, language string) ([]MediaMeta, error)
 	}
 
+	// CORSManager is implemented by storage handlers whose backend supports
+	// configuring cross-origin resource sharing (CORS) rules on the bucket.
+	// Only a subset of handlers (object storage providers) implement it.
+	CORSManager interface {
+		// CORS configures the CORS rules required by Cloudreve on the storage backend.
+		CORS() error
+	}
+
 	Capabilities struct {
 		StaticFeatures *boolset.BooleanSet
 		// MaxSourceExpire indicates the maximum allowed expiration duration of a source URL
