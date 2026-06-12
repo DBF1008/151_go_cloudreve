@@ -141,7 +141,9 @@ func (m *MeilisearchIndexer) EnsureIndex(ctx context.Context) error {
 func (m *MeilisearchIndexer) IndexFile(ctx context.Context, ownerID, fileID, entityID int, fileName, text string) error {
 	chunks := ChunkText(text, m.chunkSize)
 	if len(chunks) == 0 {
-		return nil
+		// No extractable text content; still create a filename-only document
+		// so that the file remains searchable by its name.
+		chunks = []string{""}
 	}
 
 	docs := make([]searcher.SearchDocument, 0, len(chunks))

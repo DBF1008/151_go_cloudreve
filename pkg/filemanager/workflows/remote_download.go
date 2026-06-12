@@ -75,6 +75,7 @@ const (
 	SummaryKeySrcDstPolicyID = "dst_policy_id"
 	SummaryKeyFailed         = "failed"
 	SummaryKeyTotal          = "total"
+	SummaryKeySkipped        = "skipped"
 )
 
 func init() {
