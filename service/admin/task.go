@@ -13,6 +13,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v4/pkg/queue"
 	"github.com/cloudreve/Cloudreve/v4/pkg/serializer"
 	"github.com/cloudreve/Cloudreve/v4/pkg/setting"
+	"github.com/cloudreve/Cloudreve/v4/service/taskutil"
 	"github.com/gin-gonic/gin"
 	"github.com/gofrs/uuid"
 	"github.com/samber/lo"
@@ -132,57 +133,31 @@ func (s *AdminListService) Tasks(c *gin.Context) (*ListTaskResponse, error) {
 		return nil, serializer.NewError(serializer.CodeDBError, "Failed to list tasks", err)
 	}
 
-	tasks := make([]queue.Task, 0, len(res.Tasks))
-	nodeMap := make(map[int]*ent.Node)
-	for _, t := range res.Tasks {
-		task, err := queue.NewTaskFromModel(t)
-		if err != nil {
-			return nil, serializer.NewError(serializer.CodeDBError, "Failed to parse task", err)
-		}
-
-		summary := task.Summarize(hasher)
-		if summary != nil && summary.NodeID > 0 {
-			if _, ok := nodeMap[summary.NodeID]; !ok {
-				nodeMap[summary.NodeID] = nil
-			}
-		}
-		tasks = append(tasks, task)
-	}
+	tasks := taskutil.ParseTasks(res.Tasks)
+	nodeMap := taskutil.CollectNodeIDs(tasks, hasher)
 
 	// Get nodes
 	nodes, err := dep.NodeClient().GetNodeByIds(c, lo.Keys(nodeMap))
 	if err != nil {
 		return nil, serializer.NewError(serializer.CodeDBError, "Failed to query nodes", err)
 	}
-	for _, n := range nodes {
-		nodeMap[n.ID] = n
-	}
+	taskutil.FillNodes(nodeMap, nodes)
 
 	return &ListTaskResponse{
 		Pagination: res.PaginationResults,
 		Tasks: lo.Map(res.Tasks, func(task *ent.Task, i int) GetTaskResponse {
-			var (
-				uid     string
-				node    *ent.Node
-				summary *queue.Summary
-			)
-
+			var uid string
 			if task.Edges.User != nil {
 				uid = hashid.EncodeUserID(hasher, task.Edges.User.ID)
 			}
 
 			t := tasks[i]
-			summary = t.Summarize(hasher)
-			if summary != nil && summary.NodeID > 0 {
-				node = nodeMap[summary.NodeID]
-			}
-
 			return GetTaskResponse{
 				Task:       task,
 				TaskHashID: hashid.EncodeTaskID(hasher, task.ID),
 				UserHashID: uid,
-				Node:       node,
-				Summary:    summary,
+				Node:       taskutil.LookupNode(t, hasher, nodeMap),
+				Summary:    t.Summarize(hasher),
 			}
 		}),
 	}, nil
@@ -206,10 +181,7 @@ func (s *SingleTaskService) Get(c *gin.Context) (*GetTaskResponse, error) {
 		return nil, serializer.NewError(serializer.CodeDBError, "Failed to get task", err)
 	}
 
-	t, err := queue.NewTaskFromModel(task)
-	if err != nil {
-		return nil, serializer.NewError(serializer.CodeDBError, "Failed to parse task", err)
-	}
+	t := queue.NewTaskFromModelOrFallback(task)
 
 	summary := t.Summarize(hasher)
 	var (

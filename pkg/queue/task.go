@@ -125,13 +125,24 @@ func RegisterResumableTaskFactory(taskType string, factory ResumableTaskFactory)
 	taskFactories.Store(taskType, factory)
 }
 
-// NewTaskFromModel creates a Task from ent.Task model
+// NewTaskFromModel creates a Task from ent.Task model.
+// Returns error for unknown task types; callers that need strict matching (e.g. queue resume) should use this.
 func NewTaskFromModel(model *ent.Task) (Task, error) {
 	if factory, ok := taskFactories.Load(model.Type); ok {
 		return factory.(ResumableTaskFactory)(model), nil
 	}
 
 	return nil, fmt.Errorf("unknown Task type: %s", model.Type)
+}
+
+// NewTaskFromModelOrFallback creates a Task from ent.Task model, falling back to a
+// bare DBTask wrapper for unknown types so that display/enrichment paths never fail
+// just because the registry doesn't recognise a particular task type.
+func NewTaskFromModelOrFallback(model *ent.Task) Task {
+	if factory, ok := taskFactories.Load(model.Type); ok {
+		return factory.(ResumableTaskFactory)(model)
+	}
+	return &DBTask{Task: model}
 }
 
 // InMemoryTask implements part Task interface using in-memory data.
@@ -341,6 +352,10 @@ func (t *DBTask) OnSuspend(time int64) {
 	if t.Task != nil {
 		t.Task.PublicState.ResumeTime = time
 	}
+}
+
+func (t *DBTask) Do(ctx context.Context) (task.Status, error) {
+	return "", fmt.Errorf("task type not resumable")
 }
 
 func (t *DBTask) Progress(ctx context.Context) Progresses {

@@ -17,6 +17,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/workflows"
 	"github.com/cloudreve/Cloudreve/v4/pkg/queue"
 	"github.com/cloudreve/Cloudreve/v4/pkg/serializer"
+	"github.com/cloudreve/Cloudreve/v4/service/taskutil"
 	"github.com/gin-gonic/gin"
 	"github.com/gofrs/uuid"
 	"github.com/samber/lo"
@@ -353,31 +354,15 @@ func (service *ListTaskService) ListTasks(c *gin.Context) (*TaskListResponse, er
 		return nil, serializer.NewError(serializer.CodeDBError, "Failed to query tasks", err)
 	}
 
-	tasks := make([]queue.Task, 0, len(res.Tasks))
-	nodeMap := make(map[int]*ent.Node)
-	for _, t := range res.Tasks {
-		task, err := queue.NewTaskFromModel(t)
-		if err != nil {
-			return nil, serializer.NewError(serializer.CodeDBError, "Failed to parse task", err)
-		}
-
-		summary := task.Summarize(hasher)
-		if summary != nil && summary.NodeID > 0 {
-			if _, ok := nodeMap[summary.NodeID]; !ok {
-				nodeMap[summary.NodeID] = nil
-			}
-		}
-		tasks = append(tasks, task)
-	}
+	tasks := taskutil.ParseTasks(res.Tasks)
+	nodeMap := taskutil.CollectNodeIDs(tasks, hasher)
 
 	// Get nodes
 	nodes, err := dep.NodeClient().ListActiveNodes(c, lo.Keys(nodeMap))
 	if err != nil {
 		return nil, serializer.NewError(serializer.CodeDBError, "Failed to query nodes", err)
 	}
-	for _, n := range nodes {
-		nodeMap[n.ID] = n
-	}
+	taskutil.FillNodes(nodeMap, nodes)
 
 	// Build response
 	return BuildTaskListResponse(tasks, res, nodeMap, hasher), nil
