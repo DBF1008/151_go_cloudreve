@@ -21,6 +21,8 @@ type (
 		Create(ctx context.Context, params *CreateDavAccountParams) (*ent.DavAccount, error)
 		// Update updates a dav account.
 		Update(ctx context.Context, id int, params *CreateDavAccountParams) (*ent.DavAccount, error)
+		// UpdatePassword updates the password of a dav account without touching other fields.
+		UpdatePassword(ctx context.Context, id int, newPassword string) (*ent.DavAccount, error)
 		// GetByIDAndUserID returns the dav account with given id and user id.
 		GetByIDAndUserID(ctx context.Context, id, userID int) (*ent.DavAccount, error)
 		// Delete deletes the dav account.
@@ -90,6 +92,12 @@ func (c *davAccountClient) Update(ctx context.Context, id int, params *CreateDav
 		SetOptions(params.Options)
 
 	return account.Save(ctx)
+}
+
+func (c *davAccountClient) UpdatePassword(ctx context.Context, id int, newPassword string) (*ent.DavAccount, error) {
+	return c.client.DavAccount.UpdateOneID(id).
+		SetPassword(newPassword).
+		Save(ctx)
 }
 
 func (c *davAccountClient) Delete(ctx context.Context, id int) error {
