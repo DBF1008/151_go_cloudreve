@@ -205,8 +205,8 @@ func (m *RebuildIndexTask) index(ctx context.Context, dep dependency.Dep) (task.
 }
 
 // processBatch indexes a batch of files concurrently, returning the number of
-// hard failures and the number of skipped (degraded) files.
-func (m *RebuildIndexTask) processBatch(ctx context.Context, dep dependency.Dep, files []*ent.File) (failed, skipped int) {
+// hard failures, skipped (degraded) files, and excluded (storage policy filter) files.
+func (m *RebuildIndexTask) processBatch(ctx context.Context, dep dependency.Dep, files []*ent.File) (failed, skipped, excluded int) {
 	user := inventory.UserFromContext(ctx)
 
 	var (
@@ -221,7 +221,7 @@ func (m *RebuildIndexTask) processBatch(ctx context.Context, dep dependency.Dep,
 	for _, f := range files {
 		select {
 		case <-ctx.Done():
-			return failed, skipped
+			return failed, skipped, excluded
 		case sem <- struct{}{}:
 		}
 
@@ -240,14 +240,14 @@ func (m *RebuildIndexTask) processBatch(ctx context.Context, dep dependency.Dep,
 			case indexResultSkipped:
 				skipped++
 			case indexResultExcluded:
-				// Excluded by storage policy filter; counted in Indexed for progress.
+				excluded++
 			}
 			mu.Unlock()
 		}(f)
 	}
 
 	wg.Wait()
-	return failed, skipped
+	return failed, skipped, excluded
 }
 
 // indexSingleFile indexes a single file. It always attempts to create at least
