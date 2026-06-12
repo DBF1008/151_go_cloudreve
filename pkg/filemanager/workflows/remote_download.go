@@ -54,6 +54,11 @@ type (
 		GetTaskStatusTried int                     `json:"get_task_status_tried,omitempty"`
 		Transferred        map[int]interface{}     `json:"transferred,omitempty"`
 		Failed             int                     `json:"failed,omitempty"`
+		// SlaveTransferRetries counts consecutive slave upload attempts that
+		// finished without transferring any new file. It is reset whenever a
+		// round makes forward progress so that a long, steadily-progressing
+		// transfer over an unstable link never exhausts the budget.
+		SlaveTransferRetries int `json:"slave_transfer_retries,omitempty"`
 	}
 )
 
@@ -64,6 +69,10 @@ const (
 	RemoteDownloadTaskPhaseAwaitSeeding                         = "seeding"
 
 	GetTaskStatusMaxTries = 5
+
+	// SlaveTransferMaxRetries bounds how many consecutive slave upload rounds
+	// may make no forward progress before the transfer is treated as fatal.
+	SlaveTransferMaxRetries = 5
 
 	SummaryKeyDownloadStatus = "download"
 	SummaryKeySrcStr         = "src_str"
@@ -335,14 +344,9 @@ func (m *RemoteDownloadTask) slaveTransfer(ctx context.Context, dep dependency.D
 			return task.StatusError, fmt.Errorf("failed to parse dst uri %q: %s (%w)", m.state.Dst, err, queue.CriticalErr)
 		}
 
-		// Create slave upload task
-		payload := &SlaveUploadTaskState{
-			Files:       []SlaveUploadEntity{},
-			MaxParallel: dep.SettingProvider().MaxParallelTransfer(ctx),
-			UserID:      u.ID,
-		}
-
-		// Construct files to be transferred
+		// Build the list of files that still need to be transferred, skipping
+		// any file already uploaded by a previous (partially successful) round.
+		files := make([]SlaveUploadEntity, 0, len(m.state.Status.Files))
 		for _, f := range m.state.Status.Files {
 			if !f.Selected {
 				continue
@@ -355,12 +359,28 @@ func (m *RemoteDownloadTask) slaveTransfer(ctx context.Context, dep dependency.D
 
 			dst := dstUri.JoinRaw(sanitizeFileName(f.Name))
 			src := path.Join(m.state.Status.SavePath, f.Name)
-			payload.Files = append(payload.Files, SlaveUploadEntity{
+			files = append(files, SlaveUploadEntity{
 				Src:   src,
 				Uri:   dst,
 				Size:  f.Size,
 				Index: f.Index,
 			})
+		}
+
+		// Everything selected has already been transferred (e.g. a previous
+		// round uploaded the last remaining files). Skip straight to seeding
+		// instead of spawning an empty slave task.
+		if len(files) == 0 {
+			m.state.Phase = RemoteDownloadTaskPhaseAwaitSeeding
+			m.ResumeAfter(0)
+			return task.StatusSuspending, nil
+		}
+
+		// Create slave upload task for the remaining files only.
+		payload := &SlaveUploadTaskState{
+			Files:       files,
+			MaxParallel: dep.SettingProvider().MaxParallelTransfer(ctx),
+			UserID:      u.ID,
 		}
 
 		payloadStr, err := json.Marshal(payload)
@@ -391,33 +411,79 @@ func (m *RemoteDownloadTask) slaveTransfer(ctx context.Context, dep dependency.D
 
 	m.state.SlaveUploadState = &SlaveUploadTaskState{}
 	if err := json.Unmarshal([]byte(t.PrivateState), m.state.SlaveUploadState); err != nil {
-		return task.StatusError, fmt.Errorf("failed to unmarshal slave compress state: %s (%w)", err, queue.CriticalErr)
+		return task.StatusError, fmt.Errorf("failed to unmarshal slave upload state: %s (%w)", err, queue.CriticalErr)
+	}
+
+	// A canceled slave task is a fatal, user-initiated stop: terminate.
+	if t.Status == task.StatusCanceled {
+		return task.StatusError, fmt.Errorf("slave task canceled (%w)", queue.CriticalErr)
 	}
 
 	if t.Status == task.StatusError || t.Status == task.StatusCompleted {
-		if len(m.state.SlaveUploadState.Transferred) < len(m.state.SlaveUploadState.Files) {
-			// Not all files transferred, retry
-			slaveTaskId := m.state.SlaveUploadTaskID
-			m.state.SlaveUploadTaskID = 0
-			for i, _ := range m.state.SlaveUploadState.Transferred {
-				m.state.Transferred[m.state.SlaveUploadState.Files[i].Index] = struct{}{}
+		// Record every file the slave reported as transferred. The slave keys
+		// its Transferred map by the position of the file within the batch it
+		// was given, so map that position back to the downloader file index
+		// that our own Transferred set is keyed by.
+		before := len(m.state.Transferred)
+		for i := range m.state.SlaveUploadState.Transferred {
+			if i < 0 || i >= len(m.state.SlaveUploadState.Files) {
+				continue
 			}
+			m.state.Transferred[m.state.SlaveUploadState.Files[i].Index] = struct{}{}
+		}
+		madeProgress := len(m.state.Transferred) > before
 
-			m.l.Warning("Slave task %d failed to transfer %d files, retrying...", slaveTaskId, len(m.state.SlaveUploadState.Files)-len(m.state.SlaveUploadState.Transferred))
-			return task.StatusError, fmt.Errorf(
-				"slave task failed to transfer %d files, first 5 errors: %s",
-				len(m.state.SlaveUploadState.Files)-len(m.state.SlaveUploadState.Transferred),
-				m.state.SlaveUploadState.First5TransferErrors,
-			)
-		} else {
+		// Count selected files that still have not been transferred.
+		remaining := 0
+		for _, f := range m.state.Status.Files {
+			if !f.Selected {
+				continue
+			}
+			if _, ok := m.state.Transferred[f.Index]; !ok {
+				remaining++
+			}
+		}
+
+		// All selected files transferred: move on to seeding/completion.
+		if remaining == 0 {
+			m.state.SlaveTransferRetries = 0
 			m.state.Phase = RemoteDownloadTaskPhaseAwaitSeeding
 			m.ResumeAfter(0)
 			return task.StatusSuspending, nil
 		}
-	}
 
-	if t.Status == task.StatusCanceled {
-		return task.StatusError, fmt.Errorf("slave task canceled (%w)", queue.CriticalErr)
+		// Some files remain. Force a fresh slave task on the next iteration so
+		// that only the not-yet-transferred files are re-uploaded.
+		slaveTaskId := m.state.SlaveUploadTaskID
+		m.state.SlaveUploadTaskID = 0
+
+		if madeProgress {
+			// Forward progress was made: keep going without consuming the
+			// global retry budget so an unstable link can drain the batch in
+			// successive chunks instead of failing the whole task.
+			m.state.SlaveTransferRetries = 0
+			m.l.Warning("Slave task %d transferred partially, %d file(s) remaining, re-uploading remaining files...", slaveTaskId, remaining)
+			m.ResumeAfter(0)
+			return task.StatusSuspending, nil
+		}
+
+		// No file was transferred this round. Allow a bounded number of
+		// no-progress retries (transient failures may recover) before giving
+		// up and terminating the task as a fatal error.
+		m.state.SlaveTransferRetries++
+		if m.state.SlaveTransferRetries >= SlaveTransferMaxRetries {
+			return task.StatusError, fmt.Errorf(
+				"slave task made no progress after %d attempts, %d file(s) failed to transfer, first 5 errors: %s (%w)",
+				m.state.SlaveTransferRetries,
+				remaining,
+				m.state.SlaveUploadState.First5TransferErrors,
+				queue.CriticalErr,
+			)
+		}
+
+		m.l.Warning("Slave task %d made no progress (attempt %d/%d), %d file(s) remaining, retrying...", slaveTaskId, m.state.SlaveTransferRetries, SlaveTransferMaxRetries, remaining)
+		m.ResumeAfter(time.Second * 30)
+		return task.StatusSuspending, nil
 	}
 
 	m.l.Info("Slave task %d is still uploading, resume after 30s.", m.state.SlaveUploadTaskID)
