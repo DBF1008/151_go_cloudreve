@@ -171,6 +171,9 @@ type FileClient interface {
 	GetEntitiesByIDs(ctx context.Context, ids []int, page int) ([]*ent.Entity, int, error)
 	// GetEntityByID returns an entity by its ID.
 	GetEntityByID(ctx context.Context, id int) (*ent.Entity, error)
+	// GetEntityPolicyIDs returns a map of entity ID -> storage policy ID for the given entity IDs.
+	// It only reads the storage policy foreign key, so it does not open any storage source.
+	GetEntityPolicyIDs(ctx context.Context, ids []int) (map[int]int, error)
 	// Rename renames a file
 	Rename(ctx context.Context, original *ent.File, newName string) (*ent.File, error)
 	// SetParent sets parent of group of files
@@ -1126,6 +1129,28 @@ func (f *fileClient) GetEntitiesByIDs(ctx context.Context, ids []int, page int) 
 
 func (f *fileClient) GetEntityByID(ctx context.Context, id int) (*ent.Entity, error) {
 	return withEntityEagerLoading(ctx, f.client.Entity.Query().Where(entity.ID(id))).First(ctx)
+}
+
+func (f *fileClient) GetEntityPolicyIDs(ctx context.Context, ids []int) (map[int]int, error) {
+	res := make(map[int]int, len(ids))
+	if len(ids) == 0 {
+		return res, nil
+	}
+
+	// GetEntitiesByIDs is paginated and already splits the IN clause into safe batches.
+	// Loop until it reports there is no next page (negative).
+	for page := 0; page >= 0; {
+		ents, next, err := f.GetEntitiesByIDs(ctx, ids, page)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range ents {
+			res[e.ID] = e.StoragePolicyEntities
+		}
+		page = next
+	}
+
+	return res, nil
 }
 
 func (f *fileClient) GetByID(ctx context.Context, ids int) (*ent.File, error) {

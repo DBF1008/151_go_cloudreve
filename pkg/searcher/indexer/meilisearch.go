@@ -139,9 +139,35 @@ func (m *MeilisearchIndexer) EnsureIndex(ctx context.Context) error {
 }
 
 func (m *MeilisearchIndexer) IndexFile(ctx context.Context, ownerID, fileID, entityID int, fileName, text string) error {
-	chunks := ChunkText(text, m.chunkSize)
+	docs := buildDocuments(ownerID, fileID, entityID, fileName, text, m.chunkSize)
+
+	index := m.client.Index(indexName)
+	pk := "id"
+	if _, err := index.AddDocumentsWithContext(ctx, docs, &meilisearch.DocumentOptions{PrimaryKey: &pk}); err != nil {
+		return fmt.Errorf("failed to add documents: %w", err)
+	}
+
+	return nil
+}
+
+// buildDocuments builds the Meilisearch documents for a file. When the text yields no
+// chunks (empty or whitespace-only), it still emits a single document carrying the file
+// name with empty text, so the file remains discoverable by name. file_name is a
+// searchable attribute, so a name-only document is matched by file-name queries.
+func buildDocuments(ownerID, fileID, entityID int, fileName, text string, chunkSize int) []searcher.SearchDocument {
+	chunks := ChunkText(text, chunkSize)
 	if len(chunks) == 0 {
-		return nil
+		return []searcher.SearchDocument{
+			{
+				ID:       fmt.Sprintf("%d_%d", fileID, 0),
+				FileID:   fileID,
+				OwnerID:  ownerID,
+				EntityID: entityID,
+				ChunkIdx: 0,
+				FileName: fileName,
+				Text:     "",
+			},
+		}
 	}
 
 	docs := make([]searcher.SearchDocument, 0, len(chunks))
@@ -156,14 +182,7 @@ func (m *MeilisearchIndexer) IndexFile(ctx context.Context, ownerID, fileID, ent
 			Text:     chunk,
 		})
 	}
-
-	index := m.client.Index(indexName)
-	pk := "id"
-	if _, err := index.AddDocumentsWithContext(ctx, docs, &meilisearch.DocumentOptions{PrimaryKey: &pk}); err != nil {
-		return fmt.Errorf("failed to add documents: %w", err)
-	}
-
-	return nil
+	return docs
 }
 
 func (m *MeilisearchIndexer) DeleteByFileIDs(ctx context.Context, fileID ...int) error {

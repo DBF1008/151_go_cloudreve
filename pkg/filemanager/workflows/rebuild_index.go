@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -31,12 +32,20 @@ type (
 	}
 	RebuildIndexTaskPhase string
 	RebuildIndexTaskState struct {
-		Phase                 RebuildIndexTaskPhase `json:"phase"`
-		Total                 int                   `json:"total"`
-		Indexed               int                   `json:"indexed"`
-		LastFileID            int                   `json:"last_file_id"`
-		Failed                int                   `json:"failed"`
-		FilteredStoragePolicy []int                 `json:"filtered_storage_policy"`
+		Phase RebuildIndexTaskPhase `json:"phase"`
+		Total int                   `json:"total"`
+		// Indexed counts files indexed with extracted body content.
+		Indexed int `json:"indexed"`
+		// FilenameOnly counts files indexed with their file name only, because no body
+		// content could be extracted (unsupported type, extraction failure, unreadable
+		// source, or no primary entity). These are degraded successes, not failures.
+		FilenameOnly int `json:"filename_only"`
+		// Skipped counts files left out of scope by the storage policy filter.
+		Skipped int `json:"skipped"`
+		// Failed counts true indexing failures (the indexer rejected the document).
+		Failed                int   `json:"failed"`
+		LastFileID            int   `json:"last_file_id"`
+		FilteredStoragePolicy []int `json:"filtered_storage_policy"`
 	}
 )
 
@@ -49,6 +58,55 @@ const (
 
 	ProgressTypeRebuildIndex = "rebuild_index"
 )
+
+const (
+	summaryKeyIndexed      = "indexed"
+	summaryKeyFilenameOnly = "filename_only"
+	summaryKeySkipped      = "skipped"
+)
+
+// rebuildDecision is the action chosen for a file during a rebuild.
+type rebuildDecision int
+
+const (
+	decisionSkip     rebuildDecision = iota // out of the storage policy filter scope
+	decisionExtract                         // attempt body-text extraction, then index
+	decisionNameOnly                        // index the file name only (no body content)
+)
+
+// rebuildOutcome is the result of attempting to index a single file.
+type rebuildOutcome int
+
+const (
+	outcomeIndexed  rebuildOutcome = iota // indexed with extracted body content
+	outcomeNameOnly                       // indexed with file name only (degraded)
+	outcomeSkipped                        // skipped, out of storage policy scope
+)
+
+// batchStats accumulates per-file outcomes for a single batch.
+type batchStats struct {
+	indexed      int
+	filenameOnly int
+	skipped      int
+	failed       int
+}
+
+// decideRebuildAction decides what to do with a file given whether it has a primary entity,
+// that entity's storage policy ID, whether the file is eligible for text extraction, and the
+// active storage policy filter (empty means no filtering).
+//
+// When a filter is active, only files whose primary entity belongs to one of the selected
+// policies are processed; everything else (including files without a primary entity, which
+// belong to no policy) is skipped, so out-of-scope files are never indexed.
+func decideRebuildAction(hasEntity bool, policyID int, textExtractable bool, filter []int) rebuildDecision {
+	if len(filter) > 0 && (!hasEntity || !slices.Contains(filter, policyID)) {
+		return decisionSkip
+	}
+	if hasEntity && textExtractable {
+		return decisionExtract
+	}
+	return decisionNameOnly
+}
 
 func init() {
 	queue.RegisterResumableTaskFactory(queue.FullTextRebuildTaskType, NewRebuildIndexTaskFromModel)
@@ -155,6 +213,9 @@ func (m *RebuildIndexTask) nuke(ctx context.Context, dep dependency.Dep) (task.S
 	m.state.Phase = RebuildIndexPhaseIndex
 	m.state.LastFileID = 0
 	m.state.Indexed = 0
+	m.state.FilenameOnly = 0
+	m.state.Skipped = 0
+	m.state.Failed = 0
 
 	m.l.Info("Found %d indexable files, starting rebuild...", total)
 	m.ResumeAfter(0)
@@ -164,7 +225,7 @@ func (m *RebuildIndexTask) nuke(ctx context.Context, dep dependency.Dep) (task.S
 // index processes a batch of files and suspends for the next batch.
 func (m *RebuildIndexTask) index(ctx context.Context, dep dependency.Dep) (task.Status, error) {
 	atomic.StoreInt64(&m.progress[ProgressTypeRebuildIndex].Total, int64(m.state.Total))
-	atomic.StoreInt64(&m.progress[ProgressTypeRebuildIndex].Current, int64(m.state.Indexed))
+	atomic.StoreInt64(&m.progress[ProgressTypeRebuildIndex].Current, int64(m.processed()))
 
 	files, err := dep.FileClient().ListIndexableFiles(ctx, m.state.LastFileID, RebuildIndexBatchSize)
 	if err != nil {
@@ -172,30 +233,57 @@ func (m *RebuildIndexTask) index(ctx context.Context, dep dependency.Dep) (task.
 	}
 
 	if len(files) == 0 {
-		m.l.Info("Rebuild complete. %d files indexed, %d failed.", m.state.Indexed-m.state.Failed, m.state.Failed)
+		m.l.Info("Rebuild complete. %d indexed with content, %d file name only, %d skipped (out of storage policy), %d failed.",
+			m.state.Indexed, m.state.FilenameOnly, m.state.Skipped, m.state.Failed)
 		return task.StatusCompleted, nil
 	}
 
-	batchFailed := m.processBatch(ctx, dep, files)
-	m.state.Failed += batchFailed
-	m.state.Indexed += len(files)
+	stats := m.processBatch(ctx, dep, files)
+	m.state.Indexed += stats.indexed
+	m.state.FilenameOnly += stats.filenameOnly
+	m.state.Skipped += stats.skipped
+	m.state.Failed += stats.failed
 	m.state.LastFileID = files[len(files)-1].ID
 
-	atomic.StoreInt64(&m.progress[ProgressTypeRebuildIndex].Current, int64(m.state.Indexed))
+	atomic.StoreInt64(&m.progress[ProgressTypeRebuildIndex].Current, int64(m.processed()))
 
 	// Suspend and resume for next batch
 	m.ResumeAfter(0)
 	return task.StatusSuspending, nil
 }
 
+// processed returns the number of files handled so far (indexed, degraded, skipped, or
+// failed). It is used as the progress current value and reaches Total once every file has
+// been visited, even when many files are skipped by the storage policy filter.
+func (m *RebuildIndexTask) processed() int {
+	return m.state.Indexed + m.state.FilenameOnly + m.state.Skipped + m.state.Failed
+}
+
 // processBatch indexes a batch of files concurrently.
-func (m *RebuildIndexTask) processBatch(ctx context.Context, dep dependency.Dep, files []*ent.File) int {
+func (m *RebuildIndexTask) processBatch(ctx context.Context, dep dependency.Dep, files []*ent.File) batchStats {
 	user := inventory.UserFromContext(ctx)
 
+	// Resolve the storage policy of every primary entity up front in a single query, so the
+	// storage policy filter can be applied to every file (including files we never open for
+	// text extraction). This avoids opening storage sources just to read a policy ID.
+	entityIDs := make([]int, 0, len(files))
+	for _, f := range files {
+		if f.PrimaryEntity != 0 {
+			entityIDs = append(entityIDs, f.PrimaryEntity)
+		}
+	}
+	policyByEntity, err := dep.FileClient().GetEntityPolicyIDs(ctx, entityIDs)
+	if err != nil {
+		// Without policy information the filter cannot be honored safely. Count the whole
+		// batch as failed rather than risk indexing files outside the selected policies.
+		m.l.Warning("Failed to load entity storage policies for batch: %s", err)
+		return batchStats{failed: len(files)}
+	}
+
 	var (
-		wg     sync.WaitGroup
-		mu     sync.Mutex
-		failed int
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		stats batchStats
 	)
 
 	sem := make(chan struct{}, RebuildIndexConcurrent)
@@ -205,7 +293,7 @@ func (m *RebuildIndexTask) processBatch(ctx context.Context, dep dependency.Dep,
 	for _, f := range files {
 		select {
 		case <-ctx.Done():
-			return failed
+			return stats
 		case sem <- struct{}{}:
 		}
 
@@ -216,20 +304,36 @@ func (m *RebuildIndexTask) processBatch(ctx context.Context, dep dependency.Dep,
 				wg.Done()
 			}()
 
-			if err := m.indexSingleFile(ctx, dep, user, indexer, extractor, f); err != nil {
+			outcome, err := m.indexSingleFile(ctx, dep, user, indexer, extractor, f, policyByEntity[f.PrimaryEntity])
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
 				m.l.Warning("Failed to index file %d (%s): %s", f.ID, f.Name, err)
-				mu.Lock()
-				failed++
-				mu.Unlock()
+				stats.failed++
+				return
+			}
+			switch outcome {
+			case outcomeIndexed:
+				stats.indexed++
+			case outcomeNameOnly:
+				stats.filenameOnly++
+			case outcomeSkipped:
+				stats.skipped++
 			}
 		}(f)
 	}
 
 	wg.Wait()
-	return failed
+	return stats
 }
 
-// indexSingleFile extracts text from a single file and indexes it.
+// indexSingleFile indexes a single file. It always keeps at least a file-name index for
+// in-scope files: when body text cannot be extracted (unsupported type, extraction failure,
+// unreadable source) or the file has no primary entity, it degrades to a file-name-only
+// index instead of dropping the file from the index. Files outside the active storage policy
+// filter are skipped. policyID is the storage policy ID of the file's primary entity (0 when
+// the file has no primary entity).
 func (m *RebuildIndexTask) indexSingleFile(
 	ctx context.Context,
 	dep dependency.Dep,
@@ -237,47 +341,45 @@ func (m *RebuildIndexTask) indexSingleFile(
 	indexer searcher.SearchIndexer,
 	extractor searcher.TextExtractor,
 	f *ent.File,
-) error {
-	fm := manager.NewFileManager(dep, user)
-	defer fm.Recycle()
-
+	policyID int,
+) (rebuildOutcome, error) {
 	entityID := f.PrimaryEntity
-	if entityID == 0 {
-		// No primary entity, index with just the file name (no text content).
-		m.l.Debug("No primary entity for file %d, skipping.", f.ID)
-		return nil
+	hasEntity := entityID != 0
+	extractable := hasEntity && manager.ShouldExtractText(extractor, f.Name, f.Size)
+
+	decision := decideRebuildAction(hasEntity, policyID, extractable, m.state.FilteredStoragePolicy)
+	if decision == decisionSkip {
+		m.l.Debug("File %d is outside the storage policy filter scope, skipping.", f.ID)
+		return outcomeSkipped, nil
 	}
 
-	// Check if this file type is eligible for text extraction
+	// Best-effort body-text extraction. Any failure degrades to a file-name-only index so the
+	// file stays searchable by name instead of disappearing from the index entirely.
 	var text string
-	if manager.ShouldExtractText(extractor, f.Name, f.Size) {
+	if decision == decisionExtract {
+		fm := manager.NewFileManager(dep, user)
+		defer fm.Recycle()
+
 		source, err := fm.GetEntitySource(ctx, entityID)
 		if err != nil {
-			// Cannot get source; index with file name only.
-			m.l.Debug("Cannot get entity source for file %d: %s, skipping.", f.ID, err)
-			return fmt.Errorf("cannot get entity source for file %d: %w", f.ID, err)
-		}
-		defer source.Close()
-
-		if len(m.state.FilteredStoragePolicy) > 0 {
-			if !slices.Contains(m.state.FilteredStoragePolicy, source.Entity().PolicyID()) {
-				m.l.Debug("Entity source for file %d is not in filtered storage policy, skipping.", f.ID)
-				return nil
+			m.l.Warning("Cannot get entity source for file %d: %s; indexing file name only.", f.ID, err)
+		} else {
+			defer source.Close()
+			if extracted, err := extractor.Extract(ctx, source); err != nil {
+				m.l.Warning("Failed to extract text for file %d: %s; indexing file name only.", f.ID, err)
+			} else {
+				text = extracted
 			}
 		}
+	}
 
-		extracted, err := extractor.Extract(ctx, source)
-		if err != nil {
-			m.l.Debug("Failed to extract text for file %d: %s, skipping", f.ID, err)
-			return nil
-		} else {
-			text = extracted
-		}
+	if err := indexer.IndexFile(ctx, f.OwnerID, f.ID, entityID, f.Name, text); err != nil {
+		return outcomeSkipped, fmt.Errorf("failed to index file %d: %w", f.ID, err)
+	}
 
-		if err := indexer.IndexFile(ctx, f.OwnerID, f.ID, entityID, f.Name, text); err != nil {
-			return fmt.Errorf("failed to index file %d: %w", f.ID, err)
-		}
-
+	// Record which entity has been indexed so later incremental updates can detect changes
+	// and delete stale chunks. Files without a primary entity carry no such marker.
+	if hasEntity {
 		if err := dep.FileClient().UpsertMetadata(ctx, f, map[string]string{
 			dbfs.FullTextIndexKey: hashid.EncodeEntityID(dep.HashIDEncoder(), entityID),
 		}, nil); err != nil {
@@ -285,7 +387,10 @@ func (m *RebuildIndexTask) indexSingleFile(
 		}
 	}
 
-	return nil
+	if strings.TrimSpace(text) == "" {
+		return outcomeNameOnly, nil
+	}
+	return outcomeIndexed, nil
 }
 
 func (m *RebuildIndexTask) Progress(ctx context.Context) queue.Progresses {
@@ -304,8 +409,11 @@ func (m *RebuildIndexTask) Summarize(hasher hashid.Encoder) *queue.Summary {
 	return &queue.Summary{
 		Phase: string(m.state.Phase),
 		Props: map[string]any{
-			SummaryKeyFailed: m.state.Failed,
-			SummaryKeyTotal:  m.state.Total,
+			SummaryKeyTotal:        m.state.Total,
+			summaryKeyIndexed:      m.state.Indexed,
+			summaryKeyFilenameOnly: m.state.FilenameOnly,
+			summaryKeySkipped:      m.state.Skipped,
+			SummaryKeyFailed:       m.state.Failed,
 		},
 	}
 }
