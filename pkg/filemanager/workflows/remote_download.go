@@ -396,24 +396,38 @@ func (m *RemoteDownloadTask) slaveTransfer(ctx context.Context, dep dependency.D
 
 	if t.Status == task.StatusError || t.Status == task.StatusCompleted {
 		if len(m.state.SlaveUploadState.Transferred) < len(m.state.SlaveUploadState.Files) {
-			// Not all files transferred, retry
+			// Not all files transferred – merge partial progress and retry.
 			slaveTaskId := m.state.SlaveUploadTaskID
 			m.state.SlaveUploadTaskID = 0
-			for i, _ := range m.state.SlaveUploadState.Transferred {
+			for i := range m.state.SlaveUploadState.Transferred {
 				m.state.Transferred[m.state.SlaveUploadState.Files[i].Index] = struct{}{}
 			}
 
-			m.l.Warning("Slave task %d failed to transfer %d files, retrying...", slaveTaskId, len(m.state.SlaveUploadState.Files)-len(m.state.SlaveUploadState.Transferred))
-			return task.StatusError, fmt.Errorf(
-				"slave task failed to transfer %d files, first 5 errors: %s",
-				len(m.state.SlaveUploadState.Files)-len(m.state.SlaveUploadState.Transferred),
-				m.state.SlaveUploadState.First5TransferErrors,
-			)
-		} else {
-			m.state.Phase = RemoteDownloadTaskPhaseAwaitSeeding
+			remaining := len(m.state.SlaveUploadState.Files) - len(m.state.SlaveUploadState.Transferred)
+			m.l.Warning("Slave task %d failed to transfer %d files, retrying...", slaveTaskId, remaining)
+
+			if len(m.state.SlaveUploadState.Transferred) == 0 {
+				// Every file in this batch failed – surface as a real error so the
+				// queue's retry/backoff mechanism handles it (and eventually gives
+				// up after max retries).
+				return task.StatusError, fmt.Errorf(
+					"slave task failed to transfer all %d files, first 5 errors: %s",
+					len(m.state.SlaveUploadState.Files),
+					m.state.SlaveUploadState.First5TransferErrors,
+				)
+			}
+
+			// Partial success – re-enter slaveTransfer immediately without
+			// consuming a retry attempt. Already-transferred files are recorded
+			// in m.state.Transferred and will be skipped on the next iteration.
 			m.ResumeAfter(0)
 			return task.StatusSuspending, nil
 		}
+
+		// All files transferred
+		m.state.Phase = RemoteDownloadTaskPhaseAwaitSeeding
+		m.ResumeAfter(0)
+		return task.StatusSuspending, nil
 	}
 
 	if t.Status == task.StatusCanceled {
